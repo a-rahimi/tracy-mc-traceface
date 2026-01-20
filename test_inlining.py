@@ -1,19 +1,26 @@
 # %%
-from typing import NamedTuple
 from numba import njit
-from importlib import reload
-import tracer
-
-reload(tracer)
-
-# Import TestMakeDecisionHierarchically from the original test file
-from test_tracer import TestMakeDecisionHierarchically
 
 
-class User(NamedTuple):
-    metric1: tracer.Float
-    metric2: tracer.Float
-    metric3: tracer.Int
+@njit
+def func_add(x):
+    return x + 1
+
+
+@njit
+def func_sub(x):
+    return x - 2
+
+
+@njit
+def func_mul(x):
+    return x * 3
+
+
+def outer_func(x):
+    a = func_add(x)
+    b = func_sub(a)
+    return func_mul(b)
 
 
 class TestInlining:
@@ -23,6 +30,7 @@ class TestInlining:
         from numba.core import ir
         from numba import njit
         import numba
+        import inlining
 
         # VerifyNoCallsPass definition
         @register_pass(mutates_CFG=False, analysis_only=True)
@@ -73,20 +81,16 @@ class TestInlining:
                 pm = DefaultPassBuilder.define_nopython_pipeline(self.state)
                 # Add InlineAllCallsPass
                 pm.add_pass_after(
-                    tracer.InlineAllCallsPass, numba.core.untyped_passes.IRProcessing
+                    inlining.InlineAllCallsPass, numba.core.untyped_passes.IRProcessing
                 )
                 # Add Verification pass
-                pm.add_pass_after(VerifyNoCallsPass, tracer.InlineAllCallsPass)
+                pm.add_pass_after(VerifyNoCallsPass, inlining.InlineAllCallsPass)
                 pm.finalize()
                 return [pm]
 
         @njit(pipeline_class=InliningTestCompiler)
-        def compiled_func(user):
-            return TestMakeDecisionHierarchically.make_decision_hierarchically(user)
+        def compiled_func(x):
+            return outer_func(x)
 
         # Test correctness
-        u1 = User(metric1=0.9, metric2=0.9, metric3=1)
-        assert compiled_func(u1) is True
-
-        u2 = User(metric1=0.5, metric2=0.5, metric3=6)
-        assert compiled_func(u2) is True
+        assert compiled_func(10) == 27

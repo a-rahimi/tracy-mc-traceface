@@ -1,10 +1,6 @@
-# %%
 from typing import NamedTuple
 from numba import njit
-from importlib import reload
 import tracer
-
-reload(tracer)
 
 
 class User(NamedTuple):
@@ -413,17 +409,17 @@ class TestDiamondPruning:
         """Test that diamond pruning removes if statements where both branches return the same value"""
 
         @tracer.trace
-        def func_with_identical_returns(traceable: tracer.Float) -> float:
+        def func_with_unused_conditional(traceable: tracer.Float) -> float:
             if traceable > 0.5:
                 a = 2
             else:
                 a = 0.5
             return 3
 
-        result = func_with_identical_returns(tracer.Float(0.6))
+        result = func_with_unused_conditional(tracer.Float(0.6))
         assert result == 3
 
-        ir = func_with_identical_returns.trace.to_ir()
+        ir = func_with_unused_conditional.trace.to_ir()
         # Should be pruned to just a return
         assert isinstance(ir, tracer.Return)
         assert ir.expression.text == "3"

@@ -4,9 +4,11 @@ import numba
 from numba.core import ir
 from numba.core.compiler import CompilerBase, DefaultPassBuilder
 from numba.core.compiler_machinery import FunctionPass, register_pass
-from numba.core.inline_closurecall import inline_closure_call
 from numba.core import ir_utils
 import numba.core.untyped_passes
+
+import diamond_pruning_pass
+import inlining
 
 
 class Traceable:
@@ -474,226 +476,22 @@ class DeadCodeEliminationPass(FunctionPass):
         return True
 
 
-@register_pass(mutates_CFG=True, analysis_only=False)
-class DiamondPruningPass(FunctionPass):
-    """
-    Removes diamond control flow patterns where both branches are empty or jump
-    to the same target.
-    """
-
-    _name = "diamond_pruning_pass"
-
-    def __init__(self) -> None:
-        FunctionPass.__init__(self)
-
-    def run_pass(self, state: Any) -> bool:
-        func_ir = state.func_ir
-        blocks = func_ir.blocks
-        changed = False
-
-        for label, block in list(blocks.items()):
-            if isinstance(block.terminator, ir.Branch):
-                true_label = block.terminator.truebr
-                false_label = block.terminator.falsebr
-
-                true_target = self._get_jump_target(blocks, true_label)
-                false_target = self._get_jump_target(blocks, false_label)
-
-                # Case 1: Both jump to M (or match targets)
-                if (
-                    true_target is not None
-                    and false_target is not None
-                    and true_target == false_target
-                ):
-                    block.body[-1] = ir.Jump(true_target, block.terminator.loc)
-                    changed = True
-                    continue
-
-                # Case 2: True block is effectively a jump to False label
-                if true_target is not None and true_target == false_label:
-                    block.body[-1] = ir.Jump(false_label, block.terminator.loc)
-                    changed = True
-                    continue
-
-                # Case 3: False block is effectively a jump to True label
-                if false_target is not None and false_target == true_label:
-                    block.body[-1] = ir.Jump(true_label, block.terminator.loc)
-                    changed = True
-                    continue
-
-                # Case 4: Both branches return the same constant
-                true_ret = self._get_return_const(blocks, true_label)
-                false_ret = self._get_return_const(blocks, false_label)
-
-                if (
-                    true_ret is not None
-                    and false_ret is not None
-                    and true_ret == false_ret
-                ):
-                    block.body[-1] = ir.Jump(true_label, block.terminator.loc)
-                    changed = True
-                    continue
-
-        if changed:
-            ir_utils.dead_code_elimination(func_ir)
-
-        return True
-
-    def _get_jump_target(self, blocks: Any, label: int) -> Any:
-        if label not in blocks:
-            return None
-        blk = blocks[label]
-        if len(blk.body) == 1 and isinstance(blk.body[0], ir.Jump):
-            return blk.body[0].target
-        return None
-
-    def _get_return_const(self, blocks: Any, label: int) -> Any:
-        if label not in blocks:
-            return None
-        blk = blocks[label]
-        if not blk.body:
-            return None
-
-        term = blk.body[-1]
-        if not isinstance(term, ir.Return):
-            return None
-
-        local_defs = {}
-        for stmt in blk.body:
-            if isinstance(stmt, ir.Assign):
-                local_defs[stmt.target.name] = stmt.value
-
-        var = term.value
-
-        # Helper to resolve var to const
-        visited = set()
-        while isinstance(var, ir.Var):
-            if var.name in visited:
-                return None
-            visited.add(var.name)
-
-            if var.name not in local_defs:
-                return None
-
-            val = local_defs[var.name]
-
-            if isinstance(val, ir.Const):
-                return val.value
-            elif isinstance(val, ir.Expr) and val.op == "cast":
-                var = val.value
-            elif isinstance(val, ir.Var):
-                var = val
-            else:
-                return None
-
-        if isinstance(var, ir.Const):
-            return var.value
-
-        return None
-
-
-@register_pass(mutates_CFG=True, analysis_only=False)
-class InlineAllCallsPass(FunctionPass):
-    """Inlines all function calls
-
-    We don't want function calls in the traces we produce.  Numba has a built-in
-    ``InlineClosureCallPass``, but it's too conservative for our needs; it
-    inlines closures for type inference. This pass forces inlining of global
-    functions and ``njit``-compiled functions to ensure a flat trace.
-    """
-
-    _name = "inline_all_calls_pass"
-
-    def __init__(self) -> None:
-        FunctionPass.__init__(self)
-
-    def run_pass(self, state: Any) -> bool:
-        func_ir = state.func_ir
-        work_list = list(func_ir.blocks.items())
-
-        while work_list:
-            label, block = work_list.pop()
-            for i, instr in enumerate(block.body):
-                if isinstance(instr, ir.Assign):
-                    expr = instr.value
-                    if isinstance(expr, ir.Expr) and expr.op == "call":
-
-                        def impl(func_ir: Any, block: Any, i: int, expr: Any) -> bool:
-                            func_def = ir_utils.get_definition(func_ir, expr.func)
-                            func_obj = None
-
-                            if isinstance(func_def, (ir.Global, ir.FreeVar)):
-                                func_obj = getattr(func_def, "value", None)
-
-                            # Handle getattr (method calls like Class.method)
-                            elif (
-                                isinstance(func_def, ir.Expr)
-                                and func_def.op == "getattr"
-                            ):
-                                # Get the object the method is being called on
-                                obj_def = ir_utils.get_definition(
-                                    func_ir, func_def.value
-                                )
-                                if isinstance(obj_def, (ir.Global, ir.FreeVar)):
-                                    obj = getattr(obj_def, "value", None)
-                                    if obj is not None:
-                                        # Get the method from the object
-                                        attr_name = func_def.attr
-                                        func_obj = getattr(obj, attr_name, None)
-
-                            # Handle CPUDispatcher (njit functions)
-                            if func_obj and hasattr(func_obj, "py_func"):
-                                func_obj = func_obj.py_func
-
-                            if (
-                                func_obj
-                                and callable(func_obj)
-                                and not isinstance(func_obj, type)
-                                and hasattr(func_obj, "__code__")
-                            ):
-                                inline_closure_call(
-                                    func_ir,
-                                    func_ir.func_id.func.__globals__,
-                                    block,
-                                    i,
-                                    func_obj,
-                                    work_list=work_list,
-                                )
-                                return True
-
-                            if (
-                                isinstance(func_def, ir.Expr)
-                                and func_def.op == "make_function"
-                            ):
-                                inline_closure_call(
-                                    func_ir,
-                                    func_ir.func_id.func.__globals__,
-                                    block,
-                                    i,
-                                    func_def,
-                                    work_list=work_list,
-                                )
-                                return True
-
-                            return False
-
-                        if ir_utils.guard(impl, func_ir, block, i, expr):
-                            break
-
-        ir_utils.dead_code_elimination(func_ir, list(func_ir.blocks.keys()))
-        return True
-
-
 class TraceCompiler(CompilerBase):
     def define_pipelines(self) -> List[Any]:
         pm = DefaultPassBuilder.define_nopython_pipeline(self.state)
-        pm.add_pass_after(InlineAllCallsPass, numba.core.untyped_passes.IRProcessing)
-        pm.add_pass_after(numba.core.untyped_passes.DeadBranchPrune, InlineAllCallsPass)
+        pm.add_pass_after(
+            inlining.InlineAllCallsPass, numba.core.untyped_passes.IRProcessing
+        )
+        pm.add_pass_after(
+            numba.core.untyped_passes.DeadBranchPrune, inlining.InlineAllCallsPass
+        )
         pm.add_pass_after(
             DeadCodeEliminationPass, numba.core.untyped_passes.DeadBranchPrune
         )
-        pm.add_pass_after(DiamondPruningPass, DeadCodeEliminationPass)
-        pm.add_pass_after(TracingInjectionPass, DiamondPruningPass)
+        pm.add_pass_after(
+            diamond_pruning_pass.DiamondPruningPass, DeadCodeEliminationPass
+        )
+        pm.add_pass_after(TracingInjectionPass, diamond_pruning_pass.DiamondPruningPass)
         pm.finalize()
         return [pm]
 
