@@ -1,0 +1,7 @@
+# CRITICAL INSTRUCTION
+ALWAYS use the virtual environment located at `.venv/bin/python` when running Python code.
+NEVER use the system `python` or `python3` command.
+Always check for the existence of `.venv` and use it.
+
+Example:
+`.venv/bin/python my_script.py`

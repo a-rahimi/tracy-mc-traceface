@@ -1,0 +1,574 @@
+from typing import NamedTuple, Any, List, Tuple, Callable
+from dataclasses import dataclass
+import numba
+from numba import njit, objmode
+from numba.core import ir
+from numba.core.compiler import CompilerBase, DefaultPassBuilder
+from numba.core.compiler_machinery import FunctionPass, register_pass
+from numba.core.inline_closurecall import inline_closure_call
+from numba.core import ir_utils
+
+
+class Traceable:
+    pass
+
+
+class Float(float, Traceable):
+    pass
+
+
+class Int(int, Traceable):
+    pass
+
+
+class TraceEvent(NamedTuple):
+    op: str
+    output_var: str
+    output_val: Any
+    inputs: List[Tuple[str, Any]]  # (var_name, value)
+    lineno: int
+
+
+@dataclass
+class Expression:
+    text: str
+    value: Any = None
+
+    def __str__(self) -> str:
+        return self.text
+
+
+@dataclass
+class Return:
+    expression: Expression
+
+    def __str__(self) -> str:
+        return f"return {self.expression.text}"
+
+
+@dataclass
+class Conditional:
+    condition: Expression
+    value: Return | "Conditional"
+
+    def __str__(self) -> str:
+        cond_val_str = (
+            f" (={self.condition.value})" if self.condition.value is not None else ""
+        )
+        parts = [f"if {self.condition.text}{cond_val_str}:"]
+        if self.value:
+            for line in str(self.value).splitlines():
+                parts.append(f"  {line}")
+        return "\n".join(parts)
+
+
+def stringify_constant(val: Any) -> str:
+    return f"{val:.4f}" if isinstance(val, float) else str(val)
+
+
+class Trace:
+    def __init__(self, events: List[TraceEvent]) -> None:
+        self.events = events
+
+    def to_ir(self) -> Return | Conditional | None:
+        var_exprs = {}
+        BINARY_OPS = {
+            "add": "+",
+            "sub": "-",
+            "mul": "*",
+            "div": "/",
+            "truediv": "/",
+            "floordiv": "//",
+            "mod": "%",
+            "pow": "**",
+            "gt": ">",
+            "ge": ">=",
+            "lt": "<",
+            "le": "<=",
+            "eq": "==",
+            "ne": "!=",
+            "bitand": "&",
+            "bitor": "|",
+            "bitxor": "^",
+            "lshift": "<<",
+            "rshift": ">>",
+        }
+
+        def resolve(name: str, val: Any) -> str:
+            if name in var_exprs:
+                return var_exprs[name]
+            if name.startswith("$const") or name.startswith("const("):
+                return stringify_constant(val)
+            if name.startswith("$") and not name.startswith("$const"):
+                return "unknown variable"
+            return name
+
+        nodes = []
+
+        for event in self.events:
+            if event.op == "branch":
+                cond_name, cond_val = event.inputs[0]
+                expr_str = resolve(cond_name, cond_val)
+                # Skip creating Conditional if condition is a concrete boolean value
+                # (True/False) rather than an Expression
+                if expr_str in ("True", "False"):
+                    # Skip this conditional entirely - it's a concrete value, not an expression
+                    continue
+                # Create Conditional. value (body) is not yet known.
+                nodes.append(Conditional(Expression(expr_str, cond_val), None))
+
+            elif event.op == "return":
+                if event.inputs:
+                    val_name, val_val = event.inputs[0]
+                    expr_str = resolve(val_name, val_val)
+                else:
+                    expr_str = stringify_constant(event.output_val)
+
+                node = Return(Expression(expr_str, event.output_val))
+                nodes.append(node)
+
+            elif event.op in ("cast", "assign") and len(event.inputs) == 1:
+                in_name, in_val = event.inputs[0]
+                var_exprs[event.output_var] = resolve(in_name, in_val)
+
+            elif event.op in BINARY_OPS:
+                lhs_name, lhs_val = event.inputs[0]
+                rhs_name, rhs_val = event.inputs[1]
+                lhs_expr = resolve(lhs_name, lhs_val)
+                rhs_expr = resolve(rhs_name, rhs_val)
+                op_sym = BINARY_OPS[event.op]
+                var_exprs[event.output_var] = f"({lhs_expr} {op_sym} {rhs_expr})"
+
+            elif event.op == "bool":
+                if event.inputs:
+                    name, val = event.inputs[0]
+                    var_exprs[event.output_var] = resolve(name, val)
+                else:
+                    var_exprs[event.output_var] = "False"
+
+            else:
+                args_str = ", ".join(resolve(name, val) for name, val in event.inputs)
+                var_exprs[event.output_var] = f"{event.op}({args_str})"
+
+        # Link nodes
+        if not nodes:
+            return None
+
+        for i in range(len(nodes) - 2, -1, -1):
+            if isinstance(nodes[i], Conditional):
+                nodes[i].value = nodes[i + 1]
+
+        return nodes[0]
+
+    def pretty_print(self) -> str:
+        return str(self.to_ir())
+
+
+# Global context for the current trace
+_CURRENT_TRACE: List[TraceEvent] = []
+
+
+@njit
+def _log_trace_tuple(record: Tuple[str, str, Any, str, Any, str, Any, int]) -> None:
+    with objmode():
+        op_name, out_name, out_val, in1_name, in1_val, in2_name, in2_val, lineno = (
+            record
+        )
+        inputs = []
+        if in1_name:
+            val_name = in1_name
+            if isinstance(in1_val, Traceable) and hasattr(in1_val, "var_name"):
+                val_name = in1_val.var_name
+            inputs.append((val_name, in1_val))
+        if in2_name:
+            val_name = in2_name
+            if isinstance(in2_val, Traceable) and hasattr(in2_val, "var_name"):
+                val_name = in2_val.var_name
+            inputs.append((val_name, in2_val))
+
+        if isinstance(out_val, Traceable) and hasattr(out_val, "var_name"):
+            out_name = out_val.var_name
+
+        _CURRENT_TRACE.append(TraceEvent(op_name, out_name, out_val, inputs, lineno))
+
+
+@register_pass(mutates_CFG=True, analysis_only=False)
+class TracingInjectionPass(FunctionPass):
+    """Injects tracing code into the function's IR.
+
+    When the function is subsequently compiled, it'll log its key steps into
+    a global list of TraceEvents.
+    """
+
+    _name = "tracing_injection_pass"
+
+    def __init__(self) -> None:
+        FunctionPass.__init__(self)
+
+    def run_pass(self, state: Any) -> bool:
+        func_ir = state.func_ir
+
+        # Make the tracer functino available to the function we're modifying.
+        func_ir.func_id.func.__globals__["_log_trace_tuple"] = _log_trace_tuple
+
+        # Record variable assignments. The python cmopiler introduces lots of
+        # anonymous temporary variables, and we'll have to undo those
+        # assignments.
+        definitions = {}
+        for block in func_ir.blocks.values():
+            for stmt in block.body:
+                if isinstance(stmt, ir.Assign):
+                    definitions[stmt.target.name] = stmt.value
+
+        def resolve_name(var: Any) -> str:
+            if isinstance(var, ir.Var) and var.name in definitions:
+                defn = definitions[var.name]
+                if isinstance(defn, ir.Expr) and defn.op == "getattr":
+                    return defn.attr
+            return getattr(var, "name", str(var))
+
+        for block in func_ir.blocks.values():
+            new_body = []
+            for stmt in block.body:
+                # BinOp (Arithmetic)
+                if (
+                    isinstance(stmt, ir.Assign)
+                    and isinstance(stmt.value, ir.Expr)
+                    and stmt.value.op == "binop"
+                ):
+                    new_body.append(stmt)
+                    self._inject_log(
+                        new_body,
+                        stmt.loc,
+                        stmt.value.fn,
+                        stmt.target,
+                        stmt.target,
+                        resolve_name(stmt.value.lhs),
+                        stmt.value.lhs,
+                        resolve_name(stmt.value.rhs),
+                        stmt.value.rhs,
+                    )
+
+                # InplaceBinOp
+                elif (
+                    isinstance(stmt, ir.Assign)
+                    and isinstance(stmt.value, ir.Expr)
+                    and stmt.value.op == "inplace_binop"
+                ):
+                    new_body.append(stmt)
+                    self._inject_log(
+                        new_body,
+                        stmt.loc,
+                        stmt.value.fn,
+                        stmt.target,
+                        stmt.target,
+                        resolve_name(stmt.value.lhs),
+                        stmt.value.lhs,
+                        resolve_name(stmt.value.rhs),
+                        stmt.value.rhs,
+                    )
+
+                # Cast
+                elif (
+                    isinstance(stmt, ir.Assign)
+                    and isinstance(stmt.value, ir.Expr)
+                    and stmt.value.op == "cast"
+                ):
+                    new_body.append(stmt)
+                    self._inject_log(
+                        new_body,
+                        stmt.loc,
+                        "cast",
+                        stmt.target,
+                        stmt.target,
+                        resolve_name(stmt.value.value),
+                        stmt.value.value,
+                        "",
+                        None,
+                    )
+
+                # Simple Assignment (Var or Const)
+                elif isinstance(stmt, ir.Assign) and (
+                    isinstance(stmt.value, ir.Var) or isinstance(stmt.value, ir.Const)
+                ):
+                    new_body.append(stmt)
+
+                    val_to_log = stmt.value
+                    if isinstance(stmt.value, ir.Const):
+                        val_to_log = stmt.value.value
+
+                    self._inject_log(
+                        new_body,
+                        stmt.loc,
+                        "assign",
+                        stmt.target,
+                        stmt.target,
+                        resolve_name(stmt.value),
+                        val_to_log,
+                        "",
+                        None,
+                    )
+
+                # Branch
+                elif isinstance(stmt, ir.Branch):
+                    self._inject_log(
+                        new_body,
+                        stmt.loc,
+                        "branch",
+                        resolve_name(stmt.cond),
+                        stmt.cond,
+                        resolve_name(stmt.cond),
+                        stmt.cond,
+                        "",
+                        None,
+                    )
+                    new_body.append(stmt)
+
+                # Return
+                elif isinstance(stmt, ir.Return):
+                    self._inject_log(
+                        new_body,
+                        stmt.loc,
+                        "return",
+                        "return_val",
+                        stmt.value,
+                        resolve_name(stmt.value),
+                        stmt.value,
+                        "",
+                        None,
+                    )
+                    new_body.append(stmt)
+
+                # Generic Expr Assignment
+                elif isinstance(stmt, ir.Assign) and isinstance(stmt.value, ir.Expr):
+                    new_body.append(stmt)
+
+                    op = stmt.value.op
+                    op_to_log = op
+                    in1_name = ""
+                    in1_val = None
+
+                    if op == "call":
+                        # Try to resolve function name
+                        func_var = stmt.value.func
+                        func_def = ir_utils.get_definition(func_ir, func_var)
+                        if isinstance(func_def, (ir.Global, ir.FreeVar)):
+                            func_obj = getattr(func_def, "value", None)
+                            if func_obj:
+                                if hasattr(func_obj, "__name__"):
+                                    op_to_log = func_obj.__name__
+                                else:
+                                    op_to_log = str(func_obj)
+
+                    if op == "call" and stmt.value.args:
+                        in1_name = resolve_name(stmt.value.args[0])
+                        in1_val = stmt.value.args[0]
+                    else:
+                        try:
+                            val = stmt.value.value
+                            in1_name = resolve_name(val)
+                            in1_val = val
+                        except (KeyError, AttributeError):
+                            pass
+
+                    self._inject_log(
+                        new_body,
+                        stmt.loc,
+                        op_to_log,
+                        stmt.target,
+                        stmt.target,
+                        in1_name,
+                        in1_val,
+                        "",
+                        None,
+                    )
+
+                else:
+                    new_body.append(stmt)
+
+            block.body = new_body
+
+        # Insert global definition at entry block
+        first_label = min(func_ir.blocks.keys())
+        entry_block = func_ir.blocks[first_label]
+        scope = entry_block.scope
+        loc = entry_block.loc
+
+        log_var = ir.Var(scope, "$log_trace_tuple", loc)
+        assign_global = ir.Assign(
+            ir.Global("_log_trace_tuple", _log_trace_tuple, loc), log_var, loc
+        )
+        entry_block.body.insert(0, assign_global)
+
+        return True
+
+    def _inject_log(
+        self,
+        body_list: List[Any],
+        loc: ir.Loc,
+        op_name: Any,
+        out_name: Any,
+        out_val_var: Any,
+        in1_name: Any,
+        in1_val_var: Any,
+        in2_name: Any,
+        in2_val_var: Any,
+    ) -> None:
+        # 'log_var' is available as "$log_trace_tuple" in the scope (via dominance)
+        scope = (
+            out_val_var.scope if hasattr(out_val_var, "scope") else ir.Scope(None, loc)
+        )
+        log_func = ir.Var(scope, "$log_trace_tuple", loc)
+
+        def ensure_var(val: Any) -> ir.Var:
+            if isinstance(val, ir.Var):
+                return val
+
+            # Handle non-string op_name (like functions)
+            if callable(val) and hasattr(val, "__name__"):
+                val = val.__name__
+
+            # Create const var
+            v = ir.Var(scope, f"$const_{id(val)}", loc)
+            body_list.append(ir.Assign(ir.Const(val, loc), v, loc))
+            return v
+
+        args = [
+            ensure_var(op_name),
+            ensure_var(out_name if isinstance(out_name, str) else str(out_name)),
+            ensure_var(out_val_var),
+            ensure_var(in1_name if isinstance(in1_name, str) else str(in1_name)),
+            ensure_var(in1_val_var),
+            ensure_var(in2_name if isinstance(in2_name, str) else str(in2_name)),
+            ensure_var(in2_val_var) if in2_val_var is not None else ensure_var(0),
+            ensure_var(loc.line),
+        ]
+
+        # Build tuple
+        tuple_var = ir.Var(scope, f"$tuple_{id(args)}", loc)
+        tuple_expr = ir.Expr.build_tuple(args, loc)
+        body_list.append(ir.Assign(tuple_expr, tuple_var, loc))
+
+        # Call _log_trace_tuple(tuple_var)
+        call_expr = ir.Expr.call(log_func, [tuple_var], (), loc)
+
+        # Dummy return var
+        dummy_var = ir.Var(scope, f"$log_ret_{loc.line}_{id(call_expr)}", loc)
+        body_list.append(ir.Assign(call_expr, dummy_var, loc))
+
+
+@register_pass(mutates_CFG=True, analysis_only=False)
+class InlineAllCallsPass(FunctionPass):
+    """Inlines all function calls
+
+    We don't want function calls in the traces we produce.  Numba has a built-in
+    ``InlineClosureCallPass``, but it's too conservative for our needs; it
+    inlines closures for type inference. This pass forces inlining of global
+    functions and ``njit``-compiled functions to ensure a flat trace.
+    """
+
+    _name = "inline_all_calls_pass"
+
+    def __init__(self) -> None:
+        FunctionPass.__init__(self)
+
+    def run_pass(self, state: Any) -> bool:
+        func_ir = state.func_ir
+        work_list = list(func_ir.blocks.items())
+
+        while work_list:
+            label, block = work_list.pop()
+            for i, instr in enumerate(block.body):
+                if isinstance(instr, ir.Assign):
+                    expr = instr.value
+                    if isinstance(expr, ir.Expr) and expr.op == "call":
+
+                        def impl(func_ir: Any, block: Any, i: int, expr: Any) -> bool:
+                            func_def = ir_utils.get_definition(func_ir, expr.func)
+                            func_obj = None
+
+                            if isinstance(func_def, (ir.Global, ir.FreeVar)):
+                                func_obj = getattr(func_def, "value", None)
+
+                            # Handle getattr (method calls like Class.method)
+                            elif (
+                                isinstance(func_def, ir.Expr)
+                                and func_def.op == "getattr"
+                            ):
+                                # Get the object the method is being called on
+                                obj_def = ir_utils.get_definition(
+                                    func_ir, func_def.value
+                                )
+                                if isinstance(obj_def, (ir.Global, ir.FreeVar)):
+                                    obj = getattr(obj_def, "value", None)
+                                    if obj is not None:
+                                        # Get the method from the object
+                                        attr_name = func_def.attr
+                                        func_obj = getattr(obj, attr_name, None)
+
+                            # Handle CPUDispatcher (njit functions)
+                            if func_obj and hasattr(func_obj, "py_func"):
+                                func_obj = func_obj.py_func
+
+                            if (
+                                func_obj
+                                and callable(func_obj)
+                                and not isinstance(func_obj, type)
+                                and hasattr(func_obj, "__code__")
+                            ):
+                                inline_closure_call(
+                                    func_ir,
+                                    func_ir.func_id.func.__globals__,
+                                    block,
+                                    i,
+                                    func_obj,
+                                    work_list=work_list,
+                                )
+                                return True
+
+                            if (
+                                isinstance(func_def, ir.Expr)
+                                and func_def.op == "make_function"
+                            ):
+                                inline_closure_call(
+                                    func_ir,
+                                    func_ir.func_id.func.__globals__,
+                                    block,
+                                    i,
+                                    func_def,
+                                    work_list=work_list,
+                                )
+                                return True
+
+                            return False
+
+                        if ir_utils.guard(impl, func_ir, block, i, expr):
+                            break
+
+        ir_utils.dead_code_elimination(func_ir, list(func_ir.blocks.keys()))
+        return True
+
+
+class TraceCompiler(CompilerBase):
+    def define_pipelines(self) -> List[Any]:
+        pm = DefaultPassBuilder.define_nopython_pipeline(self.state)
+        pm.add_pass_after(InlineAllCallsPass, numba.core.untyped_passes.IRProcessing)
+        pm.add_pass_after(TracingInjectionPass, InlineAllCallsPass)
+        pm.finalize()
+        return [pm]
+
+
+def trace(func: Callable[..., Any]) -> Callable[..., Any]:
+    compiled_func = njit(pipeline_class=TraceCompiler)(func)
+
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        # TODO: don't rely on a global variable. Find a way to attach this to
+        # either the thread or to the function being traced.
+        global _CURRENT_TRACE
+        _CURRENT_TRACE = []  # Reset
+
+        res = compiled_func(*args, **kwargs)
+        wrapper.trace = Trace(list(_CURRENT_TRACE))
+        return res
+
+    return wrapper
