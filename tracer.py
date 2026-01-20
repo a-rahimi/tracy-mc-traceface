@@ -1,7 +1,6 @@
 from typing import NamedTuple, Any, List, Tuple, Callable
 from dataclasses import dataclass
 import numba
-from numba import njit, objmode
 from numba.core import ir
 from numba.core.compiler import CompilerBase, DefaultPassBuilder
 from numba.core.compiler_machinery import FunctionPass, register_pass
@@ -168,9 +167,9 @@ class Trace:
 _CURRENT_TRACE: List[TraceEvent] = []
 
 
-@njit
+@numba.njit
 def _log_trace_tuple(record: Tuple[str, str, Any, str, Any, str, Any, int]) -> None:
-    with objmode():
+    with numba.objmode():
         op_name, out_name, out_val, in1_name, in1_val, in2_name, in2_val, lineno = (
             record
         )
@@ -559,7 +558,7 @@ class TraceCompiler(CompilerBase):
 
 
 def trace(func: Callable[..., Any]) -> Callable[..., Any]:
-    compiled_func = njit(pipeline_class=TraceCompiler)(func)
+    compiled_func = numba.njit(pipeline_class=TraceCompiler)(func)
 
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         # TODO: don't rely on a global variable. Find a way to attach this to
