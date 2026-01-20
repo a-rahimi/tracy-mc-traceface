@@ -3,6 +3,8 @@
 A taint analysis tool that tracks arithmetic operations in Python functions and
 represents them as a compact, flowchart-like structure.
 
+For a quick glance at it does, look at [demo.ipynb](demo.ipynb).
+
 ## Motivation
 
 Ideally, in a medical rationale, some formulas might be applied to various lab
