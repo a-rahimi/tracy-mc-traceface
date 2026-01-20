@@ -7,15 +7,15 @@ For a quick glance at it does, look at [demo.ipynb](demo.ipynb).
 
 ## Motivation
 
-Ideally, in a medical rationale, some formulas might be applied to various lab
-results or biometric data, some thresholds might be applied, and the process
-might be repeated a few times until a final decision is reached. But in our
-medical decision systems, the core decision logic is often interleaved with
-non-medical business logic: retrieving rules and thresholds from databases,
-fetching patient information, reformatting data, logging, exception handling,
-and other infrastructure concerns. While all of this work is necessary to obtain
-a medical decision, we expect the actual medical rationale to be as
-straightforward as a flowchart.
+We'd like to show the rationale for the medical decisions out code base makes.
+Deally, we'd show what formula was applied to which lab result or biometric
+data, which thresholds are applied, and how this process cascades into
+subsequent medical decisions.  But in our medical decision systems, the core
+decision logic is often interleaved with non-medical business logic: retrieving
+rules and thresholds from databases, fetching patient information, reformatting
+data, logging, exception handling, and other infrastructure concerns. While all
+of this work is necessary to obtain a medical decision, we expect the actual
+medical rationale to be as straightforward as a flowchart.
 
 This package extracts straightforward medical rationale from Python code. It
 uses a the Numba compiler toolchain to inserting instrumentation into the Python
@@ -117,3 +117,58 @@ Value provenance:
 3. **IR Generation**: After the function has finished executing, the recorded
    operations are converted into an even simpler expression tree that consists of
    just if-statements, infix expressions, and return values.
+
+## Does this problem really need a compiler?
+
+You might be wondering if we couldn't do this kind of tracing using runtime
+tricks, for example by overloading the operators of `Traceable` to log
+arithmetic operations. This was the original idea, and I think it can work.
+There's just one complication: there is no way to overload if-statements in Python to
+trace objects.  In Python, the only way for an object to know that it's being used
+as a condition for an if-statement is that its `__bool__` method gets called.
+But other things can cause `__bool__` to get called. Furthermore, operations
+don't know what branch of an if-statement they're occupying. They have to assume
+that they're 1) in a branch of an if-statement because `__bool__` has been
+called, and 2) they're in the branch of the if-statement dictated by the value
+of the bool.  If one is careful, the trace will never be technically wrong, but
+it can be misleading.
+
+Consider:
+
+```python
+if traceable > 0.5:
+    a = 2
+else:
+    a = 0.5
+
+return 3
+```
+
+Ideally, the log for this snippet would just show that 3 is returned regardless
+of the value of `traceable`.  Instead, because a runtime logger has to assume
+that every call to `__bool__` is the result of an if-statement, and that the branch was
+taken, it must output something like
+
+```
+if traceable > 0.5:
+    return 3
+```
+
+This trace is technically correct, but it's misleading because it leads the
+reader to conclude that `traceable` influences the output.
+
+Here is another confusing but technically correct situation:
+
+```python
+r = (traceable > 0.5)
+
+if traceable2 > 0:
+    return r
+else:
+    return -1
+```
+
+Since the tracer has to assume `__bool__` calls are conditionals, it must
+assumes the statement `r = (traceable > 0.5)` is a branch statement on `r`.  But
+no branch is taken on `r` (in fact `r` is completely ignored when `traceable2 <
+0`).
