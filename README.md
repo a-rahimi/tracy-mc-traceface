@@ -1,74 +1,68 @@
 # Traced
 
-A taint analysis tool that tracks arithmetic operations in Python functions and
-represents them as a compact, flowchart-like structure.
+A taint analysis tool that tracks arithmetic and flow control operations in
+Python functions and represents them as a compact, flowchart-like structure.
 
-For a quick glance at it does, look at [demo.ipynb](demo.ipynb).
+For a quick glance at what it does, look at [demo.ipynb](demo.ipynb).
 
 ## Motivation
 
-We'd like to show the rationale for the medical decisions out code base makes.
-Deally, we'd show what formula was applied to which lab result or biometric
-data, which thresholds are applied, and how this process cascades into
+We'd like to show the rationale for the medical decisions our code base makes.
+Ideally, we'd show what formula was applied to which lab result or biometric
+data, which thresholds were applied, and how this process cascaded into
 subsequent medical decisions.  But in our medical decision systems, the core
 decision logic is often interleaved with non-medical business logic: retrieving
 rules and thresholds from databases, fetching patient information, reformatting
 data, logging, exception handling, and other infrastructure concerns. While all
-of this work is necessary to obtain a medical decision, we expect the actual
+of this work is necessary to reach a medical decision, we expect the actual
 medical rationale to be as straightforward as a flowchart.
 
 This package extracts straightforward medical rationale from Python code. It
-uses a the Numba compiler toolchain to inserting instrumentation into the Python
-code, and simplifies its logic by inlining function calls.  When the resulting
-instrumented and compiled function executes, it generates a log of the
-operations and decisions it performed on objects that subclass from
-`trace.Traceable`. This log looks a lot like a path through a flowchart. Later,
-when you want to undersatand how the function actually reached its result, you
-can query this log, pretty-print it, etc.
+uses the Numba compiler toolchain to insert instrumentation into the Python
+code, and simplifies its logic by, for example, inlining function calls, and
+eliminating dead code.  When the resulting instrumented and compiled function
+executes, it generates a log of the operations and decisions it performed on
+objects that were marked for tracing in the function signature. This log looks a
+lot like a path through a flowchart. Later, when you want to understand how the
+function actually reached its result, you can query this log, pretty-print it,
+etc.
 
 ## How to use it
 
-1. **Mark the variables you'd like to trace**: Subclass the variables you want
-   to trace from `Traceable`. For example, if you want to trace operations on some
-   integers or floating point values, define an Int or Float class that inherits
-   from the builtin float or int classes, and mixing the Traceable base class. Make
-   your variables instances of these variables.
+1. **Mark the variables you'd like to trace**: Add type hints to the function you'd like to instrument. Annotate the arguments you'd like to trace with `tracer.Traceable[T]`, where `T` is the underlying type of the argument.
 
-2. **Decorate the functions you'd like to trace**: Use `@tracer.trace` to wrap
-   the functions that should produce rationale for the values they compute.
+2. **Decorate the functions you'd like to trace**: Decorate the function with `@tracer.trace`. This replaces the function with a compiled version that traces its arguments.
 
-3. **Call the function as usual**: Call the wrapped function as you would the
-   unwrapped function. When the function executes, its operations on Traceable
-   objects are logged.
+3. **Call the function as usual**: Call the wrapped function as you would the unwrapped function. When the function executes, its operations on traceable objects (and any variables derived from them) are logged.
 
-4. **Retriee the rationale**: After the function has finished executing, you can
-   retrieve a compact data structure that represents the oeprations that were
-   carried our on the Traceables. This data structure is a mix of condition
+4. **Retrieve the rationale**: After the function has finished executing, you can
+   retrieve a compact data structure that represents the operations that were
+   carried out on the traceable variables. This data structure is a mix of condition
    statements, return values, and infix expressions.
 
 Here's how this looks:
 
 ```python
-from tracer import trace, Float, Int
+import tracer
 from typing import NamedTuple
 
 class Patient(NamedTuple):
-    blood_pressure: Float
-    heart_rate: Int
-    temperature: Float
+    blood_pressure: float
+    heart_rate: int
+    temperature: float
 
-def calculate_risk_score(blood_pressure: Float, heart_rate: Int) -> Float:
+def calculate_risk_score(blood_pressure: float, heart_rate: int) -> float:
     """Calculate a risk score based on blood pressure and heart rate."""
     pressure_factor = blood_pressure / 100.0
     rate_factor = heart_rate / 80.0
     return pressure_factor * rate_factor
 
-def is_critical_temperature(temperature: Float) -> bool:
+def is_critical_temperature(temperature: float) -> bool:
     """Check if temperature indicates a critical condition."""
     return temperature > 37.5
 
-@trace
-def assess_patient(patient: Patient) -> bool:
+@tracer.trace
+def assess_patient(patient: tracer.Traceable[Patient]) -> bool:
     bp, hr, temp = patient.blood_pressure, patient.heart_rate, patient.temperature
     risk_score = calculate_risk_score(bp, hr)
     
@@ -100,7 +94,7 @@ Value provenance:
 
 ## How It Works Internally
 
-1. **Compilation**: Unlike regular Python functions, which are compiled to Python bytecode and executed by the CPython interpeter, functions are compiled using the Numba compiler. But compared to the stock Numba compiler, the comiler is told to implement a few custom passes:
+1. **Compilation**: Unlike regular Python functions, which are compiled to Python bytecode and executed by the CPython interpreter, functions are compiled using the Numba compiler. But compared to the stock Numba compiler, the compiler is told to implement a few custom passes:
 
    1. **Inlining**: All function calls are inlined to produce a flat trace. We do this because subroutines and flowcharts don't mix nicely. It also
       allows us to do some aggressive constant folding.
@@ -109,7 +103,7 @@ Value provenance:
       like binary operations (arithmetic, comparisons),
       conditional branches, returns, loads, and stores.
 
-2. **Trace Collection**: During execution, operations on `Traceable` objects are
+2. **Trace Collection**: During execution, operations on traceable variables are
    logged. Values that are loaded from memory are matched to previous store
    operations to recover the name of the corresponding variable. This allows us to
    later reconstruct a compact symbolic representation of the expression.
@@ -121,7 +115,7 @@ Value provenance:
 ## Does this problem really need a compiler?
 
 You might be wondering if we couldn't do this kind of tracing using runtime
-tricks, for example by overloading the operators of `Traceable` to log
+tricks, for example by overloading the operators of traceable objects to log
 arithmetic operations. This was the original idea, and I think it can work.
 There's just one complication: there is no way to overload if-statements in Python to
 trace objects.  In Python, the only way for an object to know that it's being used

@@ -4,14 +4,14 @@ import tracer
 
 
 class User(NamedTuple):
-    metric1: tracer.Float
-    metric2: tracer.Float
-    metric3: tracer.Int
+    metric1: float
+    metric2: float
+    metric3: int
 
 
 class TestMakeSimplestDecision:
     @staticmethod
-    def make_simplest_decision(user: User) -> bool:
+    def make_simplest_decision(user: tracer.Traceable[User]) -> bool:
         return user.metric3 > 5
 
     traced_make_simplest_decision = tracer.trace(make_simplest_decision.__func__)
@@ -45,7 +45,7 @@ class TestMakeSimplestDecision:
 
 class TestMakeDecision:
     @staticmethod
-    def make_decision(user: User) -> bool:
+    def make_decision(user: tracer.Traceable[User]) -> bool:
         return user.metric1 > 0.3 and user.metric2 > 0.4 and user.metric3 > 5
 
     traced_make_decision = tracer.trace(make_decision.__func__)
@@ -103,7 +103,7 @@ class TestMakeDecision:
 
 class TestMakeDecisionNestedIfs:
     @staticmethod
-    def make_decision_nested_ifs(user: User) -> bool:
+    def make_decision_nested_ifs(user: tracer.Traceable[User]) -> bool:
         if user.metric1 > 0.3:
             if user.metric2 > 0.4:
                 if user.metric3 > 5:
@@ -199,7 +199,7 @@ class TestMakeDecisionHierarchically:
         return True
 
     @staticmethod
-    def make_decision_hierarchically(user: User) -> bool:
+    def make_decision_hierarchically(user: tracer.Traceable[User]) -> bool:
         if not TestMakeDecisionHierarchically._check_system_status():
             return False
 
@@ -296,7 +296,7 @@ class TestConcreteBooleanConditions:
         """Test that conditionals with concrete False values are removed from IR"""
 
         @tracer.trace
-        def func_with_false_condition(user: User) -> bool:
+        def func_with_false_condition(user: tracer.Traceable[User]) -> bool:
             if False:
                 return True
             return False
@@ -315,7 +315,7 @@ class TestConcreteBooleanConditions:
         """Test that conditionals with concrete True values are removed from IR"""
 
         @tracer.trace
-        def func_with_true_condition(user: User) -> bool:
+        def func_with_true_condition(user: tracer.Traceable[User]) -> bool:
             if True:
                 return user.metric3 > 5
             return False
@@ -334,7 +334,7 @@ class TestConcreteBooleanConditions:
         """Test that conditionals with expression conditions (not concrete booleans) are preserved"""
 
         @tracer.trace
-        def func_with_expression_condition(user: User) -> bool:
+        def func_with_expression_condition(user: tracer.Traceable[User]) -> bool:
             if user.metric1 > 0.3:
                 return True
             return False
@@ -353,15 +353,13 @@ class TestConcreteBooleanConditions:
 
 class TestAssessPatient:
     class Patient(NamedTuple):
-        blood_pressure: tracer.Float
-        heart_rate: tracer.Int
-        temperature: tracer.Float
+        blood_pressure: float
+        heart_rate: int
+        temperature: float
 
     @staticmethod
     @njit
-    def calculate_risk_score(
-        blood_pressure: tracer.Float, heart_rate: tracer.Int
-    ) -> tracer.Float:
+    def calculate_risk_score(blood_pressure: float, heart_rate: int) -> float:
         """Calculate a risk score based on blood pressure and heart rate."""
         pressure_factor = blood_pressure / 100.0
         rate_factor = float(heart_rate) / 80.0
@@ -369,13 +367,13 @@ class TestAssessPatient:
 
     @staticmethod
     @njit
-    def is_critical_temperature(temperature: tracer.Float) -> bool:
+    def is_critical_temperature(temperature: float) -> bool:
         """Check if temperature indicates a critical condition."""
         return temperature > 37.5
 
     @staticmethod
     @tracer.trace
-    def assess_patient(patient) -> bool:
+    def assess_patient(patient: tracer.Traceable[Patient]) -> bool:
         bp, hr, temp = patient.blood_pressure, patient.heart_rate, patient.temperature
         risk_score = TestAssessPatient.calculate_risk_score(bp, hr)
 
@@ -409,17 +407,58 @@ class TestDiamondPruning:
         """Test that diamond pruning removes if statements where both branches return the same value"""
 
         @tracer.trace
-        def func_with_unused_conditional(traceable: tracer.Float) -> float:
+        def func_with_unused_conditional(traceable: tracer.Traceable[float]) -> float:
             if traceable > 0.5:
                 a = 2
             else:
                 a = 0.5
             return 3
 
-        result = func_with_unused_conditional(tracer.Float(0.6))
+        result = func_with_unused_conditional(0.6)
         assert result == 3
 
         ir = func_with_unused_conditional.trace.to_ir()
         # Should be pruned to just a return
         assert isinstance(ir, tracer.Return)
         assert ir.expression.text == "3"
+
+
+class TestGetTraceableArgs:
+    def test_get_traceable_args_basic(self):
+        def func(a: tracer.Traceable[int], b: int, c: tracer.Traceable[float]):
+            pass
+
+        traceable_vars = tracer.get_args_to_trace(func, (1, 2, 3.0), {})
+        assert "a" in traceable_vars
+        assert "b" not in traceable_vars
+        assert "c" in traceable_vars
+        assert len(traceable_vars) == 2
+
+    def test_get_traceable_args_kwargs(self):
+        def func(a: int, b: tracer.Traceable[int]):
+            pass
+
+        traceable_vars = tracer.get_args_to_trace(func, (1,), {"b": 2})
+        assert "a" not in traceable_vars
+        assert "b" in traceable_vars
+
+    def test_get_traceable_args_defaults(self):
+        def func(a: tracer.Traceable[int] = 10):
+            pass
+
+        traceable_vars = tracer.get_args_to_trace(func, (), {})
+        assert "a" in traceable_vars
+
+    def test_get_traceable_args_no_hints(self):
+        def func(a, b):
+            pass
+
+        traceable_vars = tracer.get_args_to_trace(func, (1, 2), {})
+        assert len(traceable_vars) == 0
+
+    def test_get_traceable_args_other_hints(self):
+        def func(a: int, b: float):
+            pass
+
+        traceable_vars = tracer.get_args_to_trace(func, (1, 2.0), {})
+        assert len(traceable_vars) == 0

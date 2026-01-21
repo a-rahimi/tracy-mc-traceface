@@ -1,4 +1,6 @@
-from typing import NamedTuple, Any, List, Tuple, Callable
+from typing import NamedTuple, Any, List, Tuple, Callable, TypeVar, Generic, Dict
+import typing
+import inspect
 from dataclasses import dataclass
 import numba
 from numba.core import ir
@@ -11,15 +13,10 @@ import diamond_pruning_pass
 import inlining
 
 
-class Traceable:
-    pass
+T = TypeVar("T")
 
 
-class Float(float, Traceable):
-    pass
-
-
-class Int(int, Traceable):
+class Traceable(Generic[T]):
     pass
 
 
@@ -31,8 +28,12 @@ class TraceEvent(NamedTuple):
     lineno: int
 
 
+class TracingIRNode:
+    pass
+
+
 @dataclass
-class Expression:
+class Expression(TracingIRNode):
     text: str
     value: Any = None
 
@@ -41,7 +42,7 @@ class Expression:
 
 
 @dataclass
-class Return:
+class Return(TracingIRNode):
     expression: Expression
 
     def __str__(self) -> str:
@@ -49,7 +50,7 @@ class Return:
 
 
 @dataclass
-class Conditional:
+class Conditional(TracingIRNode):
     condition: Expression
     value: Return | "Conditional"
 
@@ -126,8 +127,7 @@ class Trace:
                 else:
                     expr_str = stringify_constant(event.output_val)
 
-                node = Return(Expression(expr_str, event.output_val))
-                nodes.append(node)
+                nodes.append(Return(Expression(expr_str, event.output_val)))
 
             elif event.op in ("cast", "assign") and len(event.inputs) == 1:
                 in_name, in_val = event.inputs[0]
@@ -168,6 +168,7 @@ class Trace:
 
 # Global context for the current trace
 _CURRENT_TRACE: List[TraceEvent] = []
+_TRACEABLE_VARS: set = set()
 
 
 @numba.njit
@@ -179,17 +180,24 @@ def _log_trace_tuple(record: Tuple[str, str, Any, str, Any, str, Any, int]) -> N
         inputs = []
         if in1_name:
             val_name = in1_name
-            if isinstance(in1_val, Traceable) and hasattr(in1_val, "var_name"):
-                val_name = in1_val.var_name
+            if in1_name in _TRACEABLE_VARS:
+                pass
             inputs.append((val_name, in1_val))
         if in2_name:
             val_name = in2_name
-            if isinstance(in2_val, Traceable) and hasattr(in2_val, "var_name"):
-                val_name = in2_val.var_name
+            if in2_name in _TRACEABLE_VARS:
+                pass
             inputs.append((val_name, in2_val))
 
-        if isinstance(out_val, Traceable) and hasattr(out_val, "var_name"):
-            out_name = out_val.var_name
+        # Propagate traceability
+        is_traceable = False
+        if in1_name and in1_name in _TRACEABLE_VARS:
+            is_traceable = True
+        if in2_name and in2_name in _TRACEABLE_VARS:
+            is_traceable = True
+
+        if is_traceable:
+            _TRACEABLE_VARS.add(out_name)
 
         _CURRENT_TRACE.append(TraceEvent(op_name, out_name, out_val, inputs, lineno))
 
@@ -477,6 +485,20 @@ class TraceCompiler(CompilerBase):
         return [pm]
 
 
+def get_args_to_trace(
+    func: Callable[..., Any], args: Tuple[Any, ...], kwargs: Dict[str, Any]
+) -> set[str]:
+    bound = inspect.signature(func).bind(*args, **kwargs)
+    bound.apply_defaults()
+    hints = typing.get_type_hints(func)
+
+    return {
+        name
+        for name in bound.arguments
+        if name in hints and typing.get_origin(hints[name]) is Traceable
+    }
+
+
 def trace(func: Callable[..., Any]) -> Callable[..., Any]:
     compiled_func = numba.njit(pipeline_class=TraceCompiler)(func)
 
@@ -484,7 +506,9 @@ def trace(func: Callable[..., Any]) -> Callable[..., Any]:
         # TODO: don't rely on a global variable. Find a way to attach this to
         # either the thread or to the function being traced.
         global _CURRENT_TRACE
+        global _TRACEABLE_VARS
         _CURRENT_TRACE = []  # Reset
+        _TRACEABLE_VARS = get_args_to_trace(func, args, kwargs)
 
         res = compiled_func(*args, **kwargs)
         wrapper.trace = Trace(list(_CURRENT_TRACE))
