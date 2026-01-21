@@ -8,6 +8,8 @@ class DiamondPruningPass(FunctionPass):
     """
     Removes diamond control flow patterns where both branches are empty or jump
     to the same target.
+
+    Runs a dead code elimination pass after.
     """
 
     _name = "diamond_pruning_pass"
@@ -20,48 +22,45 @@ class DiamondPruningPass(FunctionPass):
         blocks = func_ir.blocks
         changed = False
 
-        for label, block in list(blocks.items()):
-            if isinstance(block.terminator, ir.Branch):
-                true_label = block.terminator.truebr
-                false_label = block.terminator.falsebr
+        for block in list(blocks.values()):
+            if not isinstance(block.terminator, ir.Branch):
+                continue
 
-                true_target = self._get_jump_target(blocks, true_label)
-                false_target = self._get_jump_target(blocks, false_label)
+            true_label = block.terminator.truebr
+            false_label = block.terminator.falsebr
 
-                # Case 1: Both jump to M (or match targets)
-                if (
-                    true_target is not None
-                    and false_target is not None
-                    and true_target == false_target
-                ):
-                    block.body[-1] = ir.Jump(true_target, block.terminator.loc)
-                    changed = True
-                    continue
+            true_target = self._get_jump_target(blocks, true_label)
+            false_target = self._get_jump_target(blocks, false_label)
 
-                # Case 2: True block is effectively a jump to False label
-                if true_target is not None and true_target == false_label:
-                    block.body[-1] = ir.Jump(false_label, block.terminator.loc)
-                    changed = True
-                    continue
+            # Case 1: Both jump to M (or match targets)
+            if (
+                true_target is not None
+                and false_target is not None
+                and true_target == false_target
+            ):
+                block.body[-1] = ir.Jump(true_target, block.terminator.loc)
+                changed = True
+                continue
 
-                # Case 3: False block is effectively a jump to True label
-                if false_target is not None and false_target == true_label:
-                    block.body[-1] = ir.Jump(true_label, block.terminator.loc)
-                    changed = True
-                    continue
+            # Case 2: True block is effectively a jump to False label
+            if true_target is not None and true_target == false_label:
+                block.body[-1] = ir.Jump(false_label, block.terminator.loc)
+                changed = True
+                continue
 
-                # Case 4: Both branches return the same constant
-                true_ret = self._get_return_const(blocks, true_label)
-                false_ret = self._get_return_const(blocks, false_label)
+            # Case 3: False block is effectively a jump to True label
+            if false_target is not None and false_target == true_label:
+                block.body[-1] = ir.Jump(true_label, block.terminator.loc)
+                changed = True
+                continue
 
-                if (
-                    true_ret is not None
-                    and false_ret is not None
-                    and true_ret == false_ret
-                ):
-                    block.body[-1] = ir.Jump(true_label, block.terminator.loc)
-                    changed = True
-                    continue
+            # Case 4: Both branches return the same constant
+            true_ret = self._get_return_const(blocks, true_label)
+            false_ret = self._get_return_const(blocks, false_label)
+
+            if true_ret is not None and false_ret is not None and true_ret == false_ret:
+                block.body[-1] = ir.Jump(true_label, block.terminator.loc)
+                changed = True
 
         if changed:
             ir_utils.dead_code_elimination(func_ir)
@@ -69,26 +68,24 @@ class DiamondPruningPass(FunctionPass):
         return True
 
     def _get_jump_target(self, blocks: Any, label: int) -> Any:
-        if label not in blocks:
+        try:
+            blk = blocks[label]
+        except KeyError:
             return None
-        blk = blocks[label]
         if len(blk.body) == 1 and isinstance(blk.body[0], ir.Jump):
             return blk.body[0].target
         return None
 
     def _get_return_const(self, blocks: Any, label: int) -> Any:
-        if label not in blocks:
+        try:
+            term = blocks[label].body[-1]
+        except (KeyError, IndexError):
             return None
-        blk = blocks[label]
-        if not blk.body:
-            return None
-
-        term = blk.body[-1]
         if not isinstance(term, ir.Return):
             return None
 
         local_defs = {}
-        for stmt in blk.body:
+        for stmt in blocks[label].body:
             if isinstance(stmt, ir.Assign):
                 local_defs[stmt.target.name] = stmt.value
 
