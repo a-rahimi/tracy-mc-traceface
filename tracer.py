@@ -459,23 +459,6 @@ class TracingInjectionPass(FunctionPass):
         body_list.append(ir.Assign(call_expr, dummy_var, loc))
 
 
-@register_pass(mutates_CFG=True, analysis_only=False)
-class DeadCodeEliminationPass(FunctionPass):
-    """
-    Removes dead code (unused variables, pure statements with no side effects)
-    from the function IR.
-    """
-
-    _name = "dead_code_elimination_pass"
-
-    def __init__(self) -> None:
-        FunctionPass.__init__(self)
-
-    def run_pass(self, state: Any) -> bool:
-        ir_utils.dead_code_elimination(state.func_ir)
-        return True
-
-
 class TraceCompiler(CompilerBase):
     def define_pipelines(self) -> List[Any]:
         pm = DefaultPassBuilder.define_nopython_pipeline(self.state)
@@ -486,10 +469,8 @@ class TraceCompiler(CompilerBase):
             numba.core.untyped_passes.DeadBranchPrune, inlining.InlineAllCallsPass
         )
         pm.add_pass_after(
-            DeadCodeEliminationPass, numba.core.untyped_passes.DeadBranchPrune
-        )
-        pm.add_pass_after(
-            diamond_pruning_pass.DiamondPruningPass, DeadCodeEliminationPass
+            diamond_pruning_pass.DiamondPruningPass,
+            numba.core.untyped_passes.DeadBranchPrune,
         )
         pm.add_pass_after(TracingInjectionPass, diamond_pruning_pass.DiamondPruningPass)
         pm.finalize()
